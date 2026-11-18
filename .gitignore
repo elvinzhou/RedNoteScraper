@@ -1,5 +1,9 @@
-node_modules
-auth.json
+.env
+.browser-profile/
+screenshots/
+__pycache__/
+.pytest_cache/
+.venv/
 seen.json
 hits.jsonl
-.env
+.session_alert

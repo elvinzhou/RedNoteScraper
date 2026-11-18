@@ -1,0 +1,12 @@
+[Unit]
+Description=Scan RedNote for matching posts
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/RedNoteScraper
+ExecStartPre=-/bin/bash %h/RedNoteScraper/deploy/update.sh
+ExecStart=%h/RedNoteScraper/.venv/bin/python rednote_slots.py
+TimeoutStartSec=15min
+Nice=10
