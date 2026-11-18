@@ -36,10 +36,10 @@ journalctl --user -u rednote-slots -n 50
 systemctl --user stop rednote-slots.timer       # do this before logging in again (profile lock)
 ```
 
-The timer runs 2 minutes after boot, then every 15 minutes with up to 90 s of random delay. To change the interval (the override survives auto-updates):
+The timer runs 2 minutes after boot, then at random 10 to 20 minute gaps (10 minutes plus 0 to 10 minutes of random delay, so about every 15 on average). To change that (the override survives auto-updates):
 
 ```bash
-systemctl --user edit rednote-slots.timer   # add: [Timer] / OnUnitActiveSec= / OnUnitActiveSec=30min
+systemctl --user edit rednote-slots.timer   # add: [Timer] / OnUnitActiveSec= / OnUnitActiveSec=20min / RandomizedDelaySec=15min
 ```
  When the alert fires, stop the timer, repeat the manual login step, and start it again.
 
