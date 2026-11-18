@@ -1,33 +1,54 @@
 # RedNoteScraper
 
-Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com). It searches for configurable keywords, filters note titles with regexes, and sends matches to Discord and/or Telegram. The default config looks for mentions of new US visa appointment slots (usvisascheduling), but anything can be watched.
+Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com). It searches for configurable keywords, filters note titles with regexes, and notifies Discord, Telegram and/or email about matches. The default config looks for posts about new US visa appointment slots (usvisascheduling), but anything can be watched.
 
 > **Heads up:** automated access likely breaches RedNote's terms of service and the site blocks aggressive scraping. Use a dedicated throwaway account (never your personal one), keep volume low, and treat hits as leads, not facts.
 
 ## How it works
 
-1. `login.js` opens a visible browser; you log in manually and the session is saved to `auth.json`.
-2. `scrape.js` loads the saved session headlessly, searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
+1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`REDNOTE_HEADLESS=0`); no password is stored.
+2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
 3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex.
-4. New hits are appended to `hits.jsonl`, deduplicated through `seen.json`, and posted to your notification channel with title, link, author, post time, likes and cover image.
-5. If the session expires or a login/captcha page appears, you get a plain-text alert (at most once per `ALERT_COOLDOWN_HOURS`) and the run exits with code 3.
+4. New hits are appended to `hits.jsonl`, deduplicated through `seen.json`, and sent with title, link, author, post time, likes and cover image.
+5. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
 
-## Setup
+It follows the same conventions as [NYTAutoRenew](https://github.com/elvinzhou/NYTAutoRenew): Python + Playwright, system Chromium on the Pi, `.env` config, a systemd user timer, and an auto-update step before each run.
 
-Requires Node 18+.
+## Running on a Raspberry Pi
+
+Needs a Pi 4/5 on 64-bit Raspberry Pi OS with a desktop session (or VNC) for the one-time login.
 
 ```bash
-npm install
-npx playwright install --with-deps chromium
-cp .env.example .env     # set KEYWORDS, term lists and a webhook
-npm run login            # on a machine with a display
-npm run scrape           # add HEADED=1 to watch the browser
-npm test
+curl -fsSL https://raw.githubusercontent.com/elvinzhou/RedNoteScraper/main/install.sh | bash
+nano ~/RedNoteScraper/.env                      # KEYWORDS, term lists, a notification channel
+cd ~/RedNoteScraper
+REDNOTE_HEADLESS=0 .venv/bin/python rednote_slots.py   # log in once in the window that opens
+systemctl --user enable --now rednote-slots.timer
+```
+
+The installer sets up apt packages (`chromium`, `python3-venv`), a venv, `.env` (with `REDNOTE_BROWSER_PATH` pointing at system Chromium) and the systemd user units, without starting them. Re-running it updates the code and keeps `.env`.
+
+Useful commands:
+
+```bash
+systemctl --user list-timers rednote-slots.timer
+journalctl --user -u rednote-slots -n 50
+systemctl --user stop rednote-slots.timer       # do this before logging in again (profile lock)
+```
+
+The timer runs 2 minutes after boot, then every 15 minutes with up to 90 s of random delay. When the alert fires, stop the timer, repeat the manual login step, and start it again.
+
+## Local development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest          # offline tests, no browser or network needed
+cp .env.example .env && .venv/bin/python rednote_slots.py
 ```
 
 ## Configuration
 
-All settings are environment variables, or a `.env` file in the working directory (real env vars win).
+Environment variables, or a `.env` next to the script (real env vars win). See `.env.example`.
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -36,30 +57,27 @@ All settings are environment variables, or a `.env` file in the working director
 | `EVENT_TERMS` | Comma-separated regexes; title must match one | none (skip check) |
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook | |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot credentials | |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_TO` | Email | |
 | `MAX_SCROLLS` | Scroll passes per keyword | `4` |
 | `DELAY_MIN_MS`, `DELAY_MAX_MS` | Random pause between actions | `2500`, `5000` |
-| `ALERT_COOLDOWN_HOURS` | Min hours between session-expired alerts | `24` |
-| `DATA_DIR` | Where `auth.json`, `seen.json`, `hits.jsonl` live | `.` |
+| `RETRIES`, `RETRY_DELAY` | Page-load retries, doubling delay (s) | `3`, `30` |
+| `ALERT_COOLDOWN_HOURS` | Min hours between alerts | `24` |
+| `DATA_DIR` | Where `hits.jsonl` / `seen.json` live | script dir |
+| `REDNOTE_HEADLESS` | `0` shows the browser for manual login | `1` |
+| `REDNOTE_PROFILE_DIR` | Browser profile dir | `./.browser-profile` |
+| `REDNOTE_BROWSER_PATH` | System browser, e.g. `/usr/bin/chromium` | bundled |
+| `REDNOTE_AUTO_UPDATE`, `REDNOTE_UPDATE_REF` | Pull `main` before each scheduled run; `0` disables | on, `main` |
 
-Terms are case-insensitive regexes, so a comma can't appear inside one. Set either or both notification channels.
+Any configured channel receives every hit and every alert; one failing channel never blocks the others. Terms are case-insensitive regexes, so a comma can't appear inside one.
 
 Discord needs only a [webhook](https://support.discord.com/hc/en-us/articles/228383668) (Channel settings, Integrations, Webhooks), not a bot. For Telegram, create a bot with @BotFather and message it once to get your chat ID.
 
-## Running on a Raspberry Pi
-
-Use a Pi 4 or 5 (4 GB+) with 64-bit Raspberry Pi OS. Do the login on your laptop and copy `auth.json` to the Pi. If the bundled Chromium misbehaves, `apt install chromium` and launch with `executablePath: '/usr/bin/chromium'`.
-
-```bash
-deploy/install.sh          # or: deploy/install.sh 10min
-systemctl list-timers rednote-slots.timer
-journalctl -u rednote-slots -n 50
-```
-
-This installs a oneshot systemd service and a timer (first run 2 minutes after boot, then every 15 minutes with up to 90 s of random delay). `.env` and `auth.json` must exist first.
+Exit codes: `0` ok, `1` every search failed (network), `2` bad config, `3` login needed or network blocked.
 
 ## Known limitations
 
+- **Blocked networks:** RedNote answers some IPs (datacenter, VPN, some clouds) with a "安全限制 / error 300012" page. The scraper detects it and alerts, but a new login won't help; use a home connection (such as the Pi on your LAN).
 - Only note **titles** are matched; the search API doesn't return bodies. Fetching note details would allow body matching.
-- API field names (`note_card.cover`, `corner_tag_info`, ...) and the logged-out detection in `scrape.js` are best guesses. Verify against a real response and adjust `filter.js` / `looksLoggedOut()`.
+- API field names (`note_card.cover`, `corner_tag_info`, ...) are best guesses and the logged-out detection is heuristic. Verify against a real logged-in run and adjust `normalise_note()` / `page_problem()` in `rednote_slots.py`.
 - The "sort by newest" click is best effort.
-- Sessions expire eventually; re-run `npm run login` and copy `auth.json` over when the alert fires.
+- Sessions expire eventually; re-login when the alert fires.

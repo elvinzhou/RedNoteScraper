@@ -1,9 +1,9 @@
 [Unit]
-Description=Run the RedNote slot scraper periodically
+Description=Scan RedNote every 15 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=@INTERVAL@
+OnUnitActiveSec=15min
 RandomizedDelaySec=90
 
 [Install]
