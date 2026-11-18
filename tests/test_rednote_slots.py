@@ -401,3 +401,23 @@ def test_extra_terms_add_a_required_group():
     assert not m("上海美签放号了")      # right topic and event, wrong city
     assert not m("北京天气")            # right city only
     assert rs.is_match("上海美签放号了", c.topic, c.event)  # extra omitted = unchanged behaviour
+
+
+def test_latin_terms_next_to_chinese_need_lookarounds_not_word_boundaries():
+    wb = rs.compile_terms("T", r"\\bB-?[12]\\b")
+    la = rs.compile_terms("T", r"(?<![A-Za-z0-9])B-?[12](?![0-9])")
+    for title in ("今天B1放号", "B1B2放号", "美签B2面签", "b2签证", "B-1/B-2 slot", "B1 B2", "B1/B2 放号"):
+        assert rs.is_match(title, la, []), title
+    assert not rs.is_match("今天B1放号", wb, [])   # the trap: Chinese chars are \w, so no boundary
+    for title in ("B12", "GB1", "B20", "B3"):
+        assert not rs.is_match(title, la, []), title
+
+
+def test_shipped_env_example_matches_b1b2_posts():
+    from pathlib import Path
+    env = dict(line.split("=", 1) for line in Path(rs.HERE / ".env.example").read_text().splitlines()
+               if "=" in line and not line.startswith("#"))
+    c = rs.Config.from_env({"TOPIC_TERMS": env["TOPIC_TERMS"], "EVENT_TERMS": env["EVENT_TERMS"]})
+    assert rs.is_match("今天B1放号", c.topic, c.event)
+    assert rs.is_match("B-1/B-2 new slots", c.topic, c.event)
+    assert not rs.is_match("GB1放号", c.topic, c.event)

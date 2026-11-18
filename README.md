@@ -58,7 +58,7 @@ cp .env.example .env && .venv/bin/python rednote_slots.py
 
 ```bash
 KEYWORDS=北京 美签 放号,北京使馆 面签 slot,usvisascheduling 北京
-EXTRA_TERMS=北京,beijing,\bBJ\b
+EXTRA_TERMS=北京,beijing,(?<![A-Za-z0-9])BJ(?![A-Za-z0-9])
 ```
 
 Add the city to `KEYWORDS` as well so RedNote's search returns those posts. Matching is on titles only, so a post that mentions Beijing only in its body is missed. For a looser search, leave `EXTRA_TERMS` empty and just search for the city. Other posts: 上海, 广州, 沈阳, 武汉.
@@ -90,7 +90,7 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `REDNOTE_BROWSER_PATH` | System browser, e.g. `/usr/bin/chromium` | bundled |
 | `REDNOTE_AUTO_UPDATE`, `REDNOTE_UPDATE_REF` | Pull `main` before each scheduled run; `0` disables | on, `main` |
 
-Any configured channel receives every hit and every alert; one failing channel never blocks the others. Terms are case-insensitive regexes, so a comma can't appear inside one.
+Any configured channel receives every hit and every alert; one failing channel never blocks the others. Terms are case-insensitive regexes, so a comma can't appear inside one. Avoid `\b` next to Chinese text: Python counts Chinese characters as word characters, so `\bB1\b` misses `今天B1放号`. Use `(?<![A-Za-z0-9])B-?[12](?![0-9])` instead, which matches B1, B-1, B2, B-2, `B1B2`, `B1/B2` and `B-1/B-2` but not `B12` or `GB1`.
 
 Discord needs only a [webhook](https://support.discord.com/hc/en-us/articles/228383668) (Channel settings, Integrations, Webhooks), not a bot. For Telegram, create a bot with @BotFather and message it once to get your chat ID.
 
