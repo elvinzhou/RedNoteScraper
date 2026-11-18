@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the RedNote slot scraper periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=@INTERVAL@
+RandomizedDelaySec=90
+
+[Install]
+WantedBy=timers.target
