@@ -49,7 +49,7 @@ cat <<MSG
 Installed. Remaining steps:
   1. Edit $DIR/.env  (set KEYWORDS, the term lists and a Discord/Telegram/SMTP channel)
   2. Log in to RedNote once, on the Pi's desktop or over VNC (use a throwaway account):
-       cd $DIR && REDNOTE_HEADLESS=0 .venv/bin/python rednote_slots.py
+       cd $DIR && .venv/bin/python rednote_slots.py --login
   3. Start the schedule:
        systemctl --user enable --now rednote-slots.timer
 MSG

@@ -1,10 +1,12 @@
 [Unit]
-Description=Scan RedNote every 15 minutes
+Description=Scan RedNote every 10-20 minutes (randomised)
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=15min
-RandomizedDelaySec=90
+# Each run is scheduled 10 min after the last one started, plus a random 0-10 min,
+# so gaps vary between 10 and 20 minutes (15 on average) instead of a fixed beat.
+OnUnitActiveSec=10min
+RandomizedDelaySec=10min
 
 [Install]
 WantedBy=timers.target

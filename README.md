@@ -6,10 +6,10 @@ Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com
 
 ## How it works
 
-1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`REDNOTE_HEADLESS=0`); no password is stored.
+1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`--login`); no password is stored.
 2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
 3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex.
-4. New hits are appended to `hits.jsonl`, deduplicated through `seen.json`, and sent with title, link, author, post time, likes and cover image.
+4. Each run only looks at what's new: posts already in `seen.json` are skipped, and scrolling stops as soon as the newest-sorted results reach posts it has seen. New hits are appended to `hits.jsonl` and sent with title, link, author, post time, likes and cover image.
 5. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
 
 It follows the same conventions as [NYTAutoRenew](https://github.com/elvinzhou/NYTAutoRenew): Python + Playwright, system Chromium on the Pi, `.env` config, a systemd user timer, and an auto-update step before each run.
@@ -22,7 +22,7 @@ Needs a Pi 4/5 on 64-bit Raspberry Pi OS with a desktop session (or VNC) for the
 curl -fsSL https://raw.githubusercontent.com/elvinzhou/RedNoteScraper/main/install.sh | bash
 nano ~/RedNoteScraper/.env                      # KEYWORDS, term lists, a notification channel
 cd ~/RedNoteScraper
-REDNOTE_HEADLESS=0 .venv/bin/python rednote_slots.py   # log in once in the window that opens
+.venv/bin/python rednote_slots.py --login   # log in once in the window that opens, then press Enter
 systemctl --user enable --now rednote-slots.timer
 ```
 
@@ -36,7 +36,12 @@ journalctl --user -u rednote-slots -n 50
 systemctl --user stop rednote-slots.timer       # do this before logging in again (profile lock)
 ```
 
-The timer runs 2 minutes after boot, then every 15 minutes with up to 90 s of random delay. When the alert fires, stop the timer, repeat the manual login step, and start it again.
+The timer runs 2 minutes after boot, then at random 10 to 20 minute gaps (10 minutes plus 0 to 10 minutes of random delay, so about every 15 on average). To change that (the override survives auto-updates):
+
+```bash
+systemctl --user edit rednote-slots.timer   # add: [Timer] / OnUnitActiveSec= / OnUnitActiveSec=20min / RandomizedDelaySec=15min
+```
+ When the alert fires, stop the timer, repeat the manual login step, and start it again.
 
 ## Local development
 
@@ -58,13 +63,15 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook | |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot credentials | |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_TO` | Email | |
-| `MAX_SCROLLS` | Scroll passes per keyword | `4` |
+| `MAX_SCROLLS` | Max scroll passes per keyword (stops early when nothing new) | `4` |
+| `MAX_NOTIFY_PER_RUN` | Hits beyond this become one summary message; `0` = no cap | `10` |
 | `DELAY_MIN_MS`, `DELAY_MAX_MS` | Random pause between actions | `2500`, `5000` |
 | `RETRIES`, `RETRY_DELAY` | Page-load retries, doubling delay (s) | `3`, `30` |
 | `ALERT_COOLDOWN_HOURS` | Min hours between alerts | `24` |
 | `DATA_DIR` | Where `hits.jsonl` / `seen.json` live | script dir |
-| `REDNOTE_HEADLESS` | `0` shows the browser for manual login | `1` |
+| `REDNOTE_HEADLESS` | `0` runs the scraper visibly | `1` |
 | `REDNOTE_PROFILE_DIR` | Browser profile dir | `./.browser-profile` |
+| `REDNOTE_BASE_URL` | Pin the site, e.g. `https://www.rednote.com` | follow the redirect |
 | `REDNOTE_BROWSER_PATH` | System browser, e.g. `/usr/bin/chromium` | bundled |
 | `REDNOTE_AUTO_UPDATE`, `REDNOTE_UPDATE_REF` | Pull `main` before each scheduled run; `0` disables | on, `main` |
 
@@ -76,6 +83,7 @@ Exit codes: `0` ok, `1` every search failed (network), `2` bad config, `3` login
 
 ## Known limitations
 
+- **Regional redirect:** from some locations `www.xiaohongshu.com` redirects to `www.rednote.com`. Logins are per domain, so the scraper follows the redirect and uses that site for both login and searches. Pin one with `REDNOTE_BASE_URL` if needed.
 - **Blocked networks:** RedNote answers some IPs (datacenter, VPN, some clouds) with a "安全限制 / error 300012" page. The scraper detects it and alerts, but a new login won't help; use a home connection (such as the Pi on your LAN).
 - Only note **titles** are matched; the search API doesn't return bodies. Fetching note details would allow body matching.
 - API field names (`note_card.cover`, `corner_tag_info`, ...) are best guesses and the logged-out detection is heuristic. Verify against a real logged-in run and adjust `normalise_note()` / `page_problem()` in `rednote_slots.py`.
