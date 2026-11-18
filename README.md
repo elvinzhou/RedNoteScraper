@@ -65,6 +65,7 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `DATA_DIR` | Where `hits.jsonl` / `seen.json` live | script dir |
 | `REDNOTE_HEADLESS` | `0` runs the scraper visibly | `1` |
 | `REDNOTE_PROFILE_DIR` | Browser profile dir | `./.browser-profile` |
+| `REDNOTE_BASE_URL` | Pin the site, e.g. `https://www.rednote.com` | follow the redirect |
 | `REDNOTE_BROWSER_PATH` | System browser, e.g. `/usr/bin/chromium` | bundled |
 | `REDNOTE_AUTO_UPDATE`, `REDNOTE_UPDATE_REF` | Pull `main` before each scheduled run; `0` disables | on, `main` |
 
@@ -76,6 +77,7 @@ Exit codes: `0` ok, `1` every search failed (network), `2` bad config, `3` login
 
 ## Known limitations
 
+- **Regional redirect:** from some locations `www.xiaohongshu.com` redirects to `www.rednote.com`. Logins are per domain, so the scraper follows the redirect and uses that site for both login and searches. Pin one with `REDNOTE_BASE_URL` if needed.
 - **Blocked networks:** RedNote answers some IPs (datacenter, VPN, some clouds) with a "安全限制 / error 300012" page. The scraper detects it and alerts, but a new login won't help; use a home connection (such as the Pi on your LAN).
 - Only note **titles** are matched; the search API doesn't return bodies. Fetching note details would allow body matching.
 - API field names (`note_card.cover`, `corner_tag_info`, ...) are best guesses and the logged-out detection is heuristic. Verify against a real logged-in run and adjust `normalise_note()` / `page_problem()` in `rednote_slots.py`.

@@ -26,6 +26,8 @@ Configuration (environment variables or a .env file next to this script):
   REDNOTE_HEADLESS "0" to run visibly (a login prompt then waits for you; default "1")
   REDNOTE_PROFILE_DIR   browser profile dir (default ./.browser-profile)
   REDNOTE_BROWSER_PATH  path to a system browser, e.g. /usr/bin/chromium (optional)
+  REDNOTE_BASE_URL  site to use, e.g. https://www.rednote.com. Default: whatever
+                   www.xiaohongshu.com redirects you to (logins are per domain)
 
 Run `python rednote_slots.py --login` once to log in by hand (opens a window, then
 verifies with a test search). Exit codes: 0 ok, 1 every search failed (network?), 2 bad config, 3 login/block (alerted).
@@ -49,7 +51,7 @@ HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "screenshots"
 MANUAL_LOGIN_WAIT = 600  # seconds to wait for a human in headful mode
 SEARCH_API = "/api/sns/web/v1/search/notes"
-EXPLORE_URL = "https://www.xiaohongshu.com/explore"
+DEFAULT_BASE = "https://www.xiaohongshu.com"  # may redirect to www.rednote.com by region
 USER_AGENT = "rednote-slots/0.1"  # Discord's edge rejects the default urllib UA
 
 
@@ -104,6 +106,7 @@ class Config:
     headless: bool
     profile_dir: Path
     browser_path: str | None
+    base_url: str | None = None
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -123,6 +126,7 @@ class Config:
             headless=env.get("REDNOTE_HEADLESS", "1") != "0",
             profile_dir=Path(env.get("REDNOTE_PROFILE_DIR") or HERE / ".browser-profile"),
             browser_path=env.get("REDNOTE_BROWSER_PATH") or None,
+            base_url=(env.get("REDNOTE_BASE_URL") or "").rstrip("/") or None,
         )
 
     @property
@@ -145,7 +149,7 @@ def is_match(text: str, topic: list[re.Pattern], event: list[re.Pattern]) -> boo
             and (not event or any(r.search(t) for r in event)))
 
 
-def normalise_note(item: dict) -> dict | None:
+def normalise_note(item: dict, base: str = DEFAULT_BASE) -> dict | None:
     """One item of RedNote's search response -> flat dict (field names are best guesses)."""
     card = item.get("note_card") or {}
     note_id = item.get("id") or card.get("note_id")
@@ -154,7 +158,7 @@ def normalise_note(item: dict) -> dict | None:
     user = card.get("user") or {}
     cover = card.get("cover") or {}
     tags = card.get("corner_tag_info") or []
-    url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    url = f"{base}/explore/{note_id}"
     if item.get("xsec_token"):
         url += f"?xsec_token={quote(item['xsec_token'], safe='')}&xsec_source=pc_search"
     return {
@@ -169,9 +173,9 @@ def normalise_note(item: dict) -> dict | None:
     }
 
 
-def extract_notes(payload: dict) -> list[dict]:
+def extract_notes(payload: dict, base: str = DEFAULT_BASE) -> list[dict]:
     items = ((payload or {}).get("data") or {}).get("items") or []
-    return [n for n in map(normalise_note, items) if n]
+    return [n for n in (normalise_note(i, base) for i in items) if n]
 
 
 # ----------------------------------------------------------------------------- notifications
@@ -340,7 +344,12 @@ def page_problem(page) -> tuple[str, str] | None:
                          "Datacenter and VPN IPs are often flagged; try another connection")
     if re.search(r"login|captcha|verify", page.url, re.I):
         return ("login", "RedNote is showing a login/captcha page (session expired or blocked)")
-    if visible(page.get_by_text("登录", exact=True), 500):
+    try:  # logged-out search box reads "登录探索更多内容" ("log in to explore more")
+        placeholder = page.get_attribute("#search-input", "placeholder", timeout=500) or ""
+    except Exception:  # noqa: BLE001
+        placeholder = ""
+    if re.search(r"登录|log ?in|sign ?in", placeholder, re.I) or any(
+            visible(page.get_by_text(t, exact=True), 300) for t in ("登录", "Log in", "Log In", "Sign in")):
         return ("login", "RedNote is asking for a login (session expired)")
     return None
 
@@ -377,7 +386,7 @@ def handle_problem(page, cfg: Config, problem: tuple[str, str]) -> None:
     if cfg.headless or kind == "block":
         raise SessionProblem(reason, shot(page, f"{kind}-problem"))
     log(reason)
-    goto_with_retry(page, EXPLORE_URL, cfg)
+    goto_with_retry(page, (cfg.base_url or origin_of(page.url)) + "/explore", cfg)
     wait_for_human("Log in to RedNote in the browser window (throwaway account).")
 
 
@@ -406,8 +415,13 @@ def load_seen(cfg: Config) -> set[str]:
         return set()
 
 
-def search_url(kw: str) -> str:
-    return f"https://www.xiaohongshu.com/search_result?keyword={quote(kw)}&source=web_search_result_notes"
+def origin_of(url: str) -> str:
+    m = re.match(r"(https?://[^/]+)", url or "")
+    return m.group(1) if m else DEFAULT_BASE
+
+
+def search_url(kw: str, base: str = DEFAULT_BASE) -> str:
+    return f"{base}/search_result?keyword={quote(kw)}&source=web_search_result_notes"
 
 
 def open_context(p, cfg: Config):
@@ -415,6 +429,54 @@ def open_context(p, cfg: Config):
     if cfg.browser_path:
         kwargs["executable_path"] = cfg.browser_path
     return p.chromium.launch_persistent_context(str(cfg.profile_dir), **kwargs)
+
+
+def attach_listeners(page, state: dict, on_payload=None) -> None:
+    """Count search API answers, remember recent API calls for diagnostics, hand JSON on."""
+    calls = state.setdefault("calls", [])
+
+    def on_response(res):
+        url = res.url
+        if "/api/" in url and re.search(r"xiaohongshu|rednote", url):
+            calls.append(f"{res.status} {url.split('?')[0][-70:]}")
+            del calls[:-15]
+        if SEARCH_API not in url:
+            return
+        state["searches"] += 1
+        if on_payload:
+            try:
+                on_payload(res.json())
+            except Exception:  # noqa: BLE001  (non-JSON / aborted)
+                pass
+
+    page.on("response", on_response)
+
+
+def describe_page(page, state: dict, context=None) -> str:
+    """One-paragraph snapshot for debugging a failed check (never includes cookie values)."""
+    try:
+        placeholder = page.get_attribute("#search-input", "placeholder", timeout=500)
+    except Exception:  # noqa: BLE001
+        placeholder = None
+    try:
+        names = sorted({c["name"] for c in context.cookies()}) if context else []
+    except Exception:  # noqa: BLE001
+        names = []
+    try:
+        title = page.title()
+    except Exception:  # noqa: BLE001
+        title = None
+    return (f"url={page.url} title={title!r} search_box_placeholder={placeholder!r} "
+            f"search_answers={state.get('searches', 0)} has_web_session_cookie={'web_session' in names} "
+            f"recent_api_calls={state.get('calls', [])[-8:]}")
+
+
+def resolve_base(page, cfg: Config) -> str:
+    """Logins are per domain, and xiaohongshu.com may redirect to rednote.com: follow it."""
+    if cfg.base_url:
+        return cfg.base_url
+    goto_with_retry(page, DEFAULT_BASE + "/explore", cfg)
+    return origin_of(page.url)
 
 
 def login_flow(cfg: Config) -> int:
@@ -427,18 +489,24 @@ def login_flow(cfg: Config) -> int:
         try:
             page = context.pages[0] if context.pages else context.new_page()
             state = {"searches": 0}
-            page.on("response", lambda r: state.__setitem__("searches", state["searches"] + 1)
-                    if SEARCH_API in r.url else None)
-            goto_with_retry(page, EXPLORE_URL, cfg)
+            attach_listeners(page, state)
+            base = resolve_base(page, cfg)
+            log(f"Using site {base}")
             wait_for_human("Log in to RedNote in the browser window (use a throwaway account; "
-                           "click 登录, finish any captcha/2FA).")
-            log("Checking the login with a test search...")
-            goto_with_retry(page, search_url(cfg.keywords[0] if cfg.keywords else "usvisascheduling"), cfg)
+                           "click the login button, finish any captcha/2FA).")
+            base = cfg.base_url or origin_of(page.url)  # you may have been sent elsewhere
+            log(f"Checking the login with a test search on {base} ...")
+            state["searches"] = 0
+            goto_with_retry(page, search_url(cfg.keywords[0] if cfg.keywords else "usvisascheduling", base), cfg)
             problem = wait_for_results(page, state, timeout=30)
             if problem:
-                log(f"Not logged in yet: {problem[1]}. Screenshot: {shot(page, 'login-check')}")
+                log(f"Not logged in yet: {problem[1]}")
+                log(f"Details: {describe_page(page, state, context)}")
+                log(f"Screenshot: {shot(page, 'login-check')}")
+                if sys.stdin.isatty():
+                    input("The window stays open so you can look at it. Press Enter to close... ")
                 return 3
-            log("Login OK: the search returned results. The session is saved in "
+            log(f"Login OK: the search returned results on {base}. The session is saved in "
                 f"{cfg.profile_dir}. You can start the timer now.")
             return 0
         finally:
@@ -457,24 +525,19 @@ def run(cfg: Config) -> int:
         try:
             page = context.pages[0] if context.pages else context.new_page()
             batch: list[dict] = []
-            state = {"searches": 0}
-
-            def on_response(res):
-                if SEARCH_API not in res.url:
-                    return
-                state["searches"] += 1
-                try:
-                    batch.extend(extract_notes(res.json()))
-                except Exception:  # noqa: BLE001  (non-JSON / aborted)
-                    pass
-
-            page.on("response", on_response)
+            state = {"searches": 0, "base": DEFAULT_BASE}
+            attach_listeners(page, state, lambda payload: batch.extend(extract_notes(payload, state["base"])))
+            try:
+                state["base"] = resolve_base(page, cfg)
+            except Exception as e:  # noqa: BLE001
+                log(f"Could not load the home page: {e!r}")
+                return 1
 
             for kw in cfg.keywords:
                 batch.clear()
                 state["searches"] = 0
                 log(f"Searching: {kw}")
-                url = search_url(kw)
+                url = search_url(kw, state["base"])
                 try:
                     goto_with_retry(page, url, cfg)
                 except Exception as e:  # noqa: BLE001
@@ -483,17 +546,23 @@ def run(cfg: Config) -> int:
                     continue
                 problem = wait_for_results(page, state)
                 if problem:
+                    log(f"Problem: {describe_page(page, state, context)}")
                     handle_problem(page, cfg, problem)  # raises unless a human can fix it
                     state["searches"] = 0
+                    state["base"] = cfg.base_url or origin_of(page.url)
+                    url = search_url(kw, state["base"])
                     goto_with_retry(page, url, cfg)
                     problem = wait_for_results(page, state)
                     if problem:
+                        log(f"Still failing: {describe_page(page, state, context)}")
                         raise SessionProblem(problem[1], shot(page, "problem"))
                 pause(cfg)
-                try:  # best effort: sort by newest
-                    page.get_by_text("最新", exact=True).first.click(timeout=3000)
-                except Exception:  # noqa: BLE001
-                    pass
+                for label in ("最新", "Latest"):  # best effort: sort by newest
+                    try:
+                        page.get_by_text(label, exact=True).first.click(timeout=2000)
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
                 pause(cfg)
 
                 for _ in range(cfg.max_scrolls):

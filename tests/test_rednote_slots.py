@@ -168,10 +168,12 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self, url="https://www.xiaohongshu.com/search_result", texts=()):
-        self.url, self.texts, self.waited = url, set(texts), 0
+    def __init__(self, url="https://www.xiaohongshu.com/search_result", texts=(), placeholder=None):
+        self.url, self.texts, self.waited, self.placeholder = url, set(texts), 0, placeholder
     def get_by_text(self, text, exact=False): return FakeLocator(text in self.texts)
+    def get_attribute(self, sel, name, timeout=None): return self.placeholder
     def wait_for_timeout(self, ms): self.waited += ms
+    def title(self): return "t"
 
 
 def test_page_problem_detection():
@@ -213,7 +215,7 @@ def test_headed_login_asks_the_human_instead_of_guessing(monkeypatch):
     monkeypatch.setattr(rs, "wait_for_human", lambda msg: steps.append(("human", msg)))
     monkeypatch.setattr(rs, "page_problem", lambda page: None)  # heuristic would say "all fine"
     rs.handle_problem(FakePage(), headed, ("login", "no results"))
-    assert [s[0] for s in steps] == ["goto", "human"] and steps[0][1] == rs.EXPLORE_URL
+    assert [s[0] for s in steps] == ["goto", "human"] and steps[0][1].endswith("/explore")
 
 
 def test_wait_for_human_uses_enter_on_a_terminal(monkeypatch):
@@ -230,3 +232,26 @@ def test_login_flag_runs_login_flow_without_keywords(monkeypatch):
     monkeypatch.setattr(rs, "login_flow", lambda cfg: 0)
     monkeypatch.setattr(rs.sys, "argv", ["rednote_slots.py", "--login"])
     assert rs.main() == 0
+
+
+def test_logged_out_search_box_and_english_button_are_detected():
+    assert rs.page_problem(FakePage(placeholder="登录探索更多内容"))[0] == "login"
+    assert rs.page_problem(FakePage(texts=["Log in"]))[0] == "login"
+    assert rs.page_problem(FakePage(placeholder="搜索小红书")) is None
+
+
+def test_site_follows_regional_redirect():
+    assert rs.origin_of("https://www.rednote.com/explore?x=1") == "https://www.rednote.com"
+    assert rs.origin_of("") == rs.DEFAULT_BASE
+    assert rs.search_url("美签 放号", "https://www.rednote.com").startswith(
+        "https://www.rednote.com/search_result?keyword=%E7%BE%8E")
+    n = rs.normalise_note({"id": "n1"}, "https://www.rednote.com")
+    assert n["url"] == "https://www.rednote.com/explore/n1"
+    assert rs.Config.from_env({"REDNOTE_BASE_URL": "https://www.rednote.com/"}).base_url == "https://www.rednote.com"
+
+
+def test_describe_page_never_leaks_cookie_values():
+    class Ctx:
+        def cookies(self): return [{"name": "web_session", "value": "SECRET"}]
+    out = rs.describe_page(FakePage(), {"searches": 0, "calls": ["200 /api/x"]}, Ctx())
+    assert "has_web_session_cookie=True" in out and "SECRET" not in out
