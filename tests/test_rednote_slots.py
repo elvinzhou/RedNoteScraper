@@ -204,3 +204,29 @@ def test_handle_problem_headless_and_block_always_raise(cfg, monkeypatch):
     headed = rs.Config.from_env({**ENV, "REDNOTE_HEADLESS": "0"})
     with pytest.raises(rs.SessionProblem):
         rs.handle_problem(FakePage(), headed, ("block", "blocked"))         # a human can't fix an IP block
+
+
+def test_headed_login_asks_the_human_instead_of_guessing(monkeypatch):
+    headed = rs.Config.from_env({**ENV, "REDNOTE_HEADLESS": "0"})
+    steps = []
+    monkeypatch.setattr(rs, "goto_with_retry", lambda page, url, cfg: steps.append(("goto", url)))
+    monkeypatch.setattr(rs, "wait_for_human", lambda msg: steps.append(("human", msg)))
+    monkeypatch.setattr(rs, "page_problem", lambda page: None)  # heuristic would say "all fine"
+    rs.handle_problem(FakePage(), headed, ("login", "no results"))
+    assert [s[0] for s in steps] == ["goto", "human"] and steps[0][1] == rs.EXPLORE_URL
+
+
+def test_wait_for_human_uses_enter_on_a_terminal(monkeypatch):
+    monkeypatch.setattr(rs.sys.stdin, "isatty", lambda: True)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or "")
+    rs.wait_for_human("Log in")
+    assert prompts and "Enter" in prompts[0]
+
+
+def test_login_flag_runs_login_flow_without_keywords(monkeypatch):
+    monkeypatch.setenv("KEYWORDS", "")
+    monkeypatch.setattr(rs, "load_dotenv", lambda p: None)
+    monkeypatch.setattr(rs, "login_flow", lambda cfg: 0)
+    monkeypatch.setattr(rs.sys, "argv", ["rednote_slots.py", "--login"])
+    assert rs.main() == 0

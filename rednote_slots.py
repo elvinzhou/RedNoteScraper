@@ -5,7 +5,7 @@ Searches each keyword, captures the search API JSON the page itself loads, keeps
 whose title matches a TOPIC term and an EVENT term, and notifies Discord / Telegram /
 email. Default config targets "new usvisascheduling slots" posts, but any topic works.
 
-RedNote password is never stored: log in once by hand (REDNOTE_HEADLESS=0); the session
+RedNote password is never stored: log in once by hand (`--login`); the session
 lives in the persistent browser profile. If a later run lands on a login/captcha page it
 sends one alert (per cooldown) and exits with code 3 so you can log in again.
 
@@ -23,11 +23,12 @@ Configuration (environment variables or a .env file next to this script):
   RETRIES (3), RETRY_DELAY (30)  page-load errors retry with doubling delay
   ALERT_COOLDOWN_HOURS (24)  min hours between "session expired" alerts
   DATA_DIR         where hits.jsonl / seen.json live (default: next to this script)
-  REDNOTE_HEADLESS "0" to show the browser and allow manual login (default "1")
+  REDNOTE_HEADLESS "0" to run visibly (a login prompt then waits for you; default "1")
   REDNOTE_PROFILE_DIR   browser profile dir (default ./.browser-profile)
   REDNOTE_BROWSER_PATH  path to a system browser, e.g. /usr/bin/chromium (optional)
 
-Exit codes: 0 ok, 1 every search failed (network?), 2 bad config, 3 login/block (alerted).
+Run `python rednote_slots.py --login` once to log in by hand (opens a window, then
+verifies with a test search). Exit codes: 0 ok, 1 every search failed (network?), 2 bad config, 3 login/block (alerted).
 """
 import json
 import os
@@ -48,6 +49,7 @@ HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "screenshots"
 MANUAL_LOGIN_WAIT = 600  # seconds to wait for a human in headful mode
 SEARCH_API = "/api/sns/web/v1/search/notes"
+EXPLORE_URL = "https://www.xiaohongshu.com/explore"
 USER_AGENT = "rednote-slots/0.1"  # Discord's edge rejects the default urllib UA
 
 
@@ -302,8 +304,8 @@ def session_problem(cfg: Config, reason: str, attachment: Path | None = None) ->
         log("Alert suppressed (cooldown)")
         return
     text = (f"⚠️ RedNote scraper stopped: {reason}\n"
-            "If it's a login: stop the timer, run `REDNOTE_HEADLESS=0 .venv/bin/python "
-            "rednote_slots.py` on the Pi's desktop/VNC, then start the timer. "
+            "If it's a login: stop the timer, run `.venv/bin/python "
+            "rednote_slots.py --login` on the Pi's desktop/VNC, then start the timer. "
             "If the network is blocked, log in won't help: change IP / wait.")
     if notify_text("RedNote scraper needs attention", text, attachment):
         cfg.alert_file.parent.mkdir(parents=True, exist_ok=True)
@@ -356,19 +358,27 @@ def wait_for_results(page, state: dict, timeout: float = 15) -> tuple[str, str] 
     return ("login", "No search results loaded (session expired, or blocked silently)")
 
 
+def wait_for_human(message: str) -> None:
+    """Block until the person says they're done (Enter), or time out without a terminal."""
+    if sys.stdin.isatty():
+        input(f"\n{message}\nPress Enter here when you're done... ")
+    else:
+        log(f"{message} (no terminal for Enter; waiting {MANUAL_LOGIN_WAIT // 60} min)")
+        time.sleep(MANUAL_LOGIN_WAIT)
+
+
 def handle_problem(page, cfg: Config, problem: tuple[str, str]) -> None:
-    """Raise SessionProblem, except in headful mode where a human can fix a login."""
+    """Raise SessionProblem, except in headful mode where a human can fix a login.
+
+    The page heuristics can't reliably tell when someone has finished logging in, so the
+    caller is asked (Enter) and then re-checks by actually running the search again.
+    """
     kind, reason = problem
     if cfg.headless or kind == "block":
         raise SessionProblem(reason, shot(page, f"{kind}-problem"))
-    log(f"Login needed: please log in in the browser window (waiting up to "
-        f"{MANUAL_LOGIN_WAIT // 60} min)")
-    deadline = time.time() + MANUAL_LOGIN_WAIT
-    while time.time() < deadline:
-        time.sleep(2)
-        if page_problem(page) is None:
-            return
-    raise SessionProblem("Timed out waiting for manual login", shot(page, "login-timeout"))
+    log(reason)
+    goto_with_retry(page, EXPLORE_URL, cfg)
+    wait_for_human("Log in to RedNote in the browser window (throwaway account).")
 
 
 def goto_with_retry(page, url: str, cfg: Config) -> None:
@@ -396,6 +406,45 @@ def load_seen(cfg: Config) -> set[str]:
         return set()
 
 
+def search_url(kw: str) -> str:
+    return f"https://www.xiaohongshu.com/search_result?keyword={quote(kw)}&source=web_search_result_notes"
+
+
+def open_context(p, cfg: Config):
+    kwargs = dict(headless=cfg.headless, locale="zh-CN", viewport={"width": 1280, "height": 900})
+    if cfg.browser_path:
+        kwargs["executable_path"] = cfg.browser_path
+    return p.chromium.launch_persistent_context(str(cfg.profile_dir), **kwargs)
+
+
+def login_flow(cfg: Config) -> int:
+    """`--login`: open the home page, let a human log in, then prove it with a real search."""
+    from playwright.sync_api import sync_playwright
+
+    cfg.headless = False
+    with sync_playwright() as p:
+        context = open_context(p, cfg)
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            state = {"searches": 0}
+            page.on("response", lambda r: state.__setitem__("searches", state["searches"] + 1)
+                    if SEARCH_API in r.url else None)
+            goto_with_retry(page, EXPLORE_URL, cfg)
+            wait_for_human("Log in to RedNote in the browser window (use a throwaway account; "
+                           "click 登录, finish any captcha/2FA).")
+            log("Checking the login with a test search...")
+            goto_with_retry(page, search_url(cfg.keywords[0] if cfg.keywords else "usvisascheduling"), cfg)
+            problem = wait_for_results(page, state, timeout=30)
+            if problem:
+                log(f"Not logged in yet: {problem[1]}. Screenshot: {shot(page, 'login-check')}")
+                return 3
+            log("Login OK: the search returned results. The session is saved in "
+                f"{cfg.profile_dir}. You can start the timer now.")
+            return 0
+        finally:
+            context.close()
+
+
 def run(cfg: Config) -> int:
     from playwright.sync_api import sync_playwright  # lazy: tests don't need it
 
@@ -404,11 +453,7 @@ def run(cfg: Config) -> int:
     new_hits = failures = 0
 
     with sync_playwright() as p:
-        kwargs = dict(headless=cfg.headless, locale="zh-CN",
-                      viewport={"width": 1280, "height": 900})
-        if cfg.browser_path:
-            kwargs["executable_path"] = cfg.browser_path
-        context = p.chromium.launch_persistent_context(str(cfg.profile_dir), **kwargs)
+        context = open_context(p, cfg)
         try:
             page = context.pages[0] if context.pages else context.new_page()
             batch: list[dict] = []
@@ -429,8 +474,7 @@ def run(cfg: Config) -> int:
                 batch.clear()
                 state["searches"] = 0
                 log(f"Searching: {kw}")
-                url = ("https://www.xiaohongshu.com/search_result?keyword="
-                       f"{quote(kw)}&source=web_search_result_notes")
+                url = search_url(kw)
                 try:
                     goto_with_retry(page, url, cfg)
                 except Exception as e:  # noqa: BLE001
@@ -488,6 +532,8 @@ def main() -> int:
     except ValueError as e:
         log(f"Config error: {e}")
         return 2
+    if "--login" in sys.argv[1:]:
+        return login_flow(cfg)
     if not cfg.keywords:
         log("KEYWORDS is empty. Copy .env.example to .env and set it.")
         return 2

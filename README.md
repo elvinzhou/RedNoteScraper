@@ -6,7 +6,7 @@ Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com
 
 ## How it works
 
-1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`REDNOTE_HEADLESS=0`); no password is stored.
+1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`--login`); no password is stored.
 2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
 3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex.
 4. New hits are appended to `hits.jsonl`, deduplicated through `seen.json`, and sent with title, link, author, post time, likes and cover image.
@@ -22,7 +22,7 @@ Needs a Pi 4/5 on 64-bit Raspberry Pi OS with a desktop session (or VNC) for the
 curl -fsSL https://raw.githubusercontent.com/elvinzhou/RedNoteScraper/main/install.sh | bash
 nano ~/RedNoteScraper/.env                      # KEYWORDS, term lists, a notification channel
 cd ~/RedNoteScraper
-REDNOTE_HEADLESS=0 .venv/bin/python rednote_slots.py   # log in once in the window that opens
+.venv/bin/python rednote_slots.py --login   # log in once in the window that opens, then press Enter
 systemctl --user enable --now rednote-slots.timer
 ```
 
@@ -63,7 +63,7 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `RETRIES`, `RETRY_DELAY` | Page-load retries, doubling delay (s) | `3`, `30` |
 | `ALERT_COOLDOWN_HOURS` | Min hours between alerts | `24` |
 | `DATA_DIR` | Where `hits.jsonl` / `seen.json` live | script dir |
-| `REDNOTE_HEADLESS` | `0` shows the browser for manual login | `1` |
+| `REDNOTE_HEADLESS` | `0` runs the scraper visibly | `1` |
 | `REDNOTE_PROFILE_DIR` | Browser profile dir | `./.browser-profile` |
 | `REDNOTE_BROWSER_PATH` | System browser, e.g. `/usr/bin/chromium` | bundled |
 | `REDNOTE_AUTO_UPDATE`, `REDNOTE_UPDATE_REF` | Pull `main` before each scheduled run; `0` disables | on, `main` |
