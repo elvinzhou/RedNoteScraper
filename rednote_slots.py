@@ -14,6 +14,11 @@ Configuration (environment variables or a .env file next to this script):
   TOPIC_TERMS      comma-separated regexes (case-insensitive); title must match one.
                    Empty = skip this check.
   EVENT_TERMS      same; title must also match one of these. Empty = skip.
+  EXTRA_TERMS      optional third group, e.g. a city: title must match one of these too.
+  MAX_POST_AGE_DAYS (1)  only posts from today and the previous N days: 0 = today only,
+                   1 = today + yesterday, "off" = no limit. Posts with an unreadable
+                   date are kept.
+  TIMEZONE         IANA zone that defines "today" (default: this machine's, e.g. Asia/Shanghai)
   DISCORD_WEBHOOK_URL
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
   SMTP_HOST, SMTP_PORT (587), SMTP_USER, SMTP_PASSWORD, MAIL_TO, MAIL_FROM
@@ -43,11 +48,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 SHOTS = HERE / "screenshots"
@@ -94,6 +100,27 @@ def compile_terms(name: str, value: str | None) -> list[re.Pattern]:
     return out
 
 
+def parse_max_age(value: str | None) -> int | None:
+    v = (value or "").strip().lower()
+    if not v:
+        return 1
+    if v in ("off", "none", "no", "-1"):
+        return None
+    try:
+        return max(0, int(v))
+    except ValueError as e:
+        raise ValueError(f"MAX_POST_AGE_DAYS: expected a number or 'off', got {value!r}") from e
+
+
+def parse_tz(value: str | None):
+    if not (value or "").strip():
+        return datetime.now().astimezone().tzinfo
+    try:
+        return ZoneInfo(value.strip())
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"TIMEZONE: unknown zone {value!r} (use e.g. Asia/Shanghai)") from e
+
+
 @dataclass
 class Config:
     keywords: list[str]
@@ -110,6 +137,9 @@ class Config:
     browser_path: str | None
     base_url: str | None = None
     max_notify: int = 10
+    extra: list[re.Pattern] = field(default_factory=list)
+    max_age_days: int | None = 1
+    tz: object = None  # tzinfo
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -131,7 +161,13 @@ class Config:
             browser_path=env.get("REDNOTE_BROWSER_PATH") or None,
             base_url=(env.get("REDNOTE_BASE_URL") or "").rstrip("/") or None,
             max_notify=int(env.get("MAX_NOTIFY_PER_RUN") or 10),
+            extra=compile_terms("EXTRA_TERMS", env.get("EXTRA_TERMS")),
+            max_age_days=parse_max_age(env.get("MAX_POST_AGE_DAYS")),
+            tz=parse_tz(env.get("TIMEZONE")),
         )
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
 
     @property
     def hits_file(self) -> Path:
@@ -147,10 +183,75 @@ class Config:
 
 
 # ----------------------------------------------------------------------------- parsing
-def is_match(text: str, topic: list[re.Pattern], event: list[re.Pattern]) -> bool:
+def is_match(text: str, topic: list[re.Pattern], event: list[re.Pattern],
+             extra: list[re.Pattern] = ()) -> bool:
+    """Title must hit one term from every non-empty group (topic AND event AND extra)."""
     t = text or ""
-    return ((not topic or any(r.search(t) for r in topic))
-            and (not event or any(r.search(t) for r in event)))
+    return all(not group or any(r.search(t) for r in group) for group in (topic, event, extra))
+
+
+_UNITS = {"分钟": "minutes", "minute": "minutes", "min": "minutes", "小时": "hours", "hour": "hours",
+          "hr": "hours", "天": "days", "day": "days", "周": "weeks", "week": "weeks"}
+
+
+def parse_posted_text(text: str, now: datetime) -> datetime | None:
+    """RedNote's visible date: '刚刚', '3小时前', '2天前', '昨天 13:20', '11-15', '2025-11-15',
+    or the English equivalents. Returns an approximate datetime, or None if unreadable."""
+    t = (text or "").strip()
+    low = t.lower()
+    if not t:
+        return None
+    try:
+        if re.search(r"刚刚|just now", low):
+            return now
+        m = (re.search(r"(\d+)\s*(分钟|小时|天|周)前", t)
+             or re.search(r"(\d+)\s*(minute|min|hour|hr|day|week)s?\s*ago", low))
+        if m:
+            unit = _UNITS[m.group(2)]
+            return now - timedelta(**{unit: int(m.group(1))})
+        day = None
+        if re.search(r"前天|day before yesterday", low):
+            day = now - timedelta(days=2)
+        elif re.search(r"昨天|yesterday", low):
+            day = now - timedelta(days=1)
+        elif re.search(r"今天|today", low):
+            day = now
+        if day is not None:
+            hm = re.search(r"(\d{1,2}):(\d{2})", t)
+            return day.replace(hour=int(hm.group(1)), minute=int(hm.group(2))) if hm else day
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+        if m:
+            return now.replace(year=int(m.group(1)), month=int(m.group(2)), day=int(m.group(3)))
+        m = re.search(r"(?<![\d-])(\d{1,2})-(\d{1,2})(?![\d-])", t)
+        if m:
+            d = now.replace(month=int(m.group(1)), day=int(m.group(2)))
+            return d.replace(year=d.year - 1) if d.date() > now.date() else d
+    except (ValueError, KeyError):
+        return None
+    return None
+
+
+def post_datetime(note: dict, now: datetime) -> datetime | None:
+    """When was this posted? Prefer the visible date; else the creation time that RedNote
+    note ids carry (24-hex ids start with a unix timestamp); else unknown."""
+    dt = parse_posted_text(note.get("posted", ""), now)
+    if dt:
+        return dt
+    nid = note.get("id", "")
+    if re.fullmatch(r"[0-9a-f]{24}", nid):
+        ts = int(nid[:8], 16)
+        if 1.3e9 < ts < now.timestamp() + 86400:  # sanity: 2011 .. tomorrow
+            return datetime.fromtimestamp(ts, now.tzinfo)
+    return None
+
+
+def too_old(note: dict, max_age_days: int | None, now: datetime) -> bool:
+    if max_age_days is None:
+        return False
+    dt = post_datetime(note, now)
+    if dt is None:
+        return False  # unknown date: keep it rather than miss a post
+    return dt.date() < now.date() - timedelta(days=max_age_days)
 
 
 def normalise_note(item: dict, base: str = DEFAULT_BASE) -> dict | None:
@@ -518,22 +619,23 @@ def login_flow(cfg: Config) -> int:
             context.close()
 
 
-def scroll_for_new(page, batch: list[dict], seen: set[str], cfg: Config, newest_first: bool) -> None:
-    """Scroll for more results, but only as far as there is something new to find."""
-    def unseen() -> int:
-        return sum(1 for n in batch if n["id"] not in seen)
+def scroll_for_new(page, batch: list[dict], is_new, cfg: Config, newest_first: bool) -> None:
+    """Scroll for more results, but only as far as there is something new to find.
+    `is_new(note)` is true for notes not yet seen and not too old."""
+    def fresh() -> int:
+        return sum(1 for n in batch if is_new(n))
 
-    if newest_first and not unseen():
+    if newest_first and not fresh():
         log("  nothing new in the newest results; not scrolling")
         return
     for _ in range(cfg.max_scrolls):
-        total, fresh = len(batch), unseen()
+        total, before = len(batch), fresh()
         page.mouse.wheel(0, 2500)
         pause(page, cfg)
         if len(batch) == total:
             break  # no more results loaded
-        if newest_first and unseen() == fresh:
-            break  # reached posts we've already seen
+        if newest_first and fresh() == before:
+            break  # reached posts we've already seen (or that are too old)
 
 
 class Notifier:
@@ -568,6 +670,8 @@ def run(cfg: Config) -> int:
     seen = load_seen(cfg)
     new_hits = failures = 0
     notifier = Notifier(cfg.max_notify)
+    now = cfg.now()
+    is_new = lambda n: n["id"] not in seen and not too_old(n, cfg.max_age_days, now)  # noqa: E731
 
     with sync_playwright() as p:
         context = open_context(p, cfg)
@@ -615,15 +719,19 @@ def run(cfg: Config) -> int:
                     except Exception:  # noqa: BLE001
                         pass
                 pause(page, cfg)
-                scroll_for_new(page, batch, seen, cfg, newest_first)
+                scroll_for_new(page, batch, is_new, cfg, newest_first)
 
                 for note in list(batch):
                     if note["id"] in seen:
                         continue
                     seen.add(note["id"])
-                    if not is_match(note["title"], cfg.topic, cfg.event):
+                    if too_old(note, cfg.max_age_days, now):
                         continue
+                    if not is_match(note["title"], cfg.topic, cfg.event, cfg.extra):
+                        continue
+                    posted_at = post_datetime(note, now)
                     hit = {**note, "keyword": kw,
+                           "post_date": posted_at.date().isoformat() if posted_at else "",
                            "found_at": datetime.now(timezone.utc).isoformat()}
                     with cfg.hits_file.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(hit, ensure_ascii=False) + "\n")

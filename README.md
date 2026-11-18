@@ -8,9 +8,10 @@ Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com
 
 1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`--login`); no password is stored.
 2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
-3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex.
-4. Each run only looks at what's new: posts already in `seen.json` are skipped, and scrolling stops as soon as the newest-sorted results reach posts it has seen. New hits are appended to `hits.jsonl` and sent with title, link, author, post time, likes and cover image.
-5. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
+3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex (**and** one `EXTRA_TERMS` regex, if you set it).
+4. Only recent posts count: by default today and yesterday (`MAX_POST_AGE_DAYS`). The date comes from the post's visible date ("3小时前", "昨天 13:20", "11-15"), falling back to the creation time embedded in the note id. Posts whose date can't be read are kept.
+5. Each run only looks at what's new: posts already in `seen.json` are skipped, and scrolling stops as soon as the newest-sorted results reach posts it has seen. New hits are appended to `hits.jsonl` and sent with title, link, author, post time, likes and cover image.
+6. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
 
 It follows the same conventions as [NYTAutoRenew](https://github.com/elvinzhou/NYTAutoRenew): Python + Playwright, system Chromium on the Pi, `.env` config, a systemd user timer, and an auto-update step before each run.
 
@@ -51,6 +52,17 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt -r requiremen
 cp .env.example .env && .venv/bin/python rednote_slots.py
 ```
 
+## Watching one embassy or consulate
+
+`TOPIC_TERMS` ("it's about a visa") and `EVENT_TERMS` ("slots opened") are different questions from "which city", so don't put a city in either: with `北京` in `TOPIC_TERMS`, any Beijing post with `放号` in the title would match. Use `EXTRA_TERMS` instead, which is an additional required group:
+
+```bash
+KEYWORDS=北京 美签 放号,北京使馆 面签 slot,usvisascheduling 北京
+EXTRA_TERMS=北京,beijing,\bBJ\b
+```
+
+Add the city to `KEYWORDS` as well so RedNote's search returns those posts. Matching is on titles only, so a post that mentions Beijing only in its body is missed. For a looser search, leave `EXTRA_TERMS` empty and just search for the city. Other posts: 上海, 广州, 沈阳, 武汉.
+
 ## Configuration
 
 Environment variables, or a `.env` next to the script (real env vars win). See `.env.example`.
@@ -60,6 +72,9 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `KEYWORDS` | Comma-separated search terms (required) | |
 | `TOPIC_TERMS` | Comma-separated regexes; title must match one | none (skip check) |
 | `EVENT_TERMS` | Comma-separated regexes; title must match one | none (skip check) |
+| `EXTRA_TERMS` | Optional third group, e.g. a city; title must match one | none (skip check) |
+| `MAX_POST_AGE_DAYS` | Today plus the previous N days (`0` today only, `off` no limit) | `1` |
+| `TIMEZONE` | IANA zone defining "today", e.g. `Asia/Shanghai` | machine's |
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook | |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot credentials | |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_TO` | Email | |
@@ -85,6 +100,7 @@ Exit codes: `0` ok, `1` every search failed (network), `2` bad config, `3` login
 
 - **Regional redirect:** from some locations `www.xiaohongshu.com` redirects to `www.rednote.com`. Logins are per domain, so the scraper follows the redirect and uses that site for both login and searches. Pin one with `REDNOTE_BASE_URL` if needed.
 - **Blocked networks:** RedNote answers some IPs (datacenter, VPN, some clouds) with a "安全限制 / error 300012" page. The scraper detects it and alerts, but a new login won't help; use a home connection (such as the Pi on your LAN).
+- The date filter relies on RedNote's visible date text (several formats are understood) or the note id's embedded creation time, which can precede publishing for posts saved as drafts. Date formats on `rednote.com` are partly guessed.
 - Only note **titles** are matched; the search API doesn't return bodies. Fetching note details would allow body matching.
 - API field names (`note_card.cover`, `corner_tag_info`, ...) are best guesses and the logged-out detection is heuristic. Verify against a real logged-in run and adjust `normalise_note()` / `page_problem()` in `rednote_slots.py`.
 - The "sort by newest" click is best effort.

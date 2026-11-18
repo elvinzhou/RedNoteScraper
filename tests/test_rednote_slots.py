@@ -274,7 +274,7 @@ def _note(i): return {"id": f"n{i}", "title": "t", "url": "u"}
 def test_scroll_skipped_when_newest_results_all_seen(cfg, monkeypatch):
     monkeypatch.setattr(rs, "pause", lambda page, c: None)
     page = ScrollPage(lambda n: None)
-    rs.scroll_for_new(page, [_note(1), _note(2)], {"n1", "n2"}, cfg, newest_first=True)
+    rs.scroll_for_new(page, [_note(1), _note(2)], lambda n: n["id"] not in {"n1", "n2"}, cfg, newest_first=True)
     assert page.scrolls == 0
 
 
@@ -284,14 +284,14 @@ def test_scroll_stops_once_it_reaches_seen_posts(cfg, monkeypatch):
     def more(n):  # pass 1 brings a new post, pass 2 brings only already-seen ones
         batch.append(_note(10 + n) if n == 1 else _note(2))
     page = ScrollPage(more)
-    rs.scroll_for_new(page, batch, {"n2"}, cfg, newest_first=True)
+    rs.scroll_for_new(page, batch, lambda n: n["id"] != "n2", cfg, newest_first=True)
     assert page.scrolls == 2
 
 
 def test_scroll_stops_when_no_more_results_load(cfg, monkeypatch):
     monkeypatch.setattr(rs, "pause", lambda page, c: None)
     page = ScrollPage(lambda n: None)
-    rs.scroll_for_new(page, [_note(1)], set(), cfg, newest_first=False)
+    rs.scroll_for_new(page, [_note(1)], lambda n: True, cfg, newest_first=False)
     assert page.scrolls == 1
 
 
@@ -299,7 +299,7 @@ def test_scroll_goes_deep_when_sort_failed(cfg, monkeypatch):
     monkeypatch.setattr(rs, "pause", lambda page, c: None)
     batch = [_note(0)]
     page = ScrollPage(lambda n: batch.append(_note(100 + n)))
-    rs.scroll_for_new(page, batch, {"n0"}, cfg, newest_first=False)
+    rs.scroll_for_new(page, batch, lambda n: n["id"] != "n0", cfg, newest_first=False)
     assert page.scrolls == cfg.max_scrolls
 
 
@@ -324,3 +324,80 @@ def test_notifier_cap_zero_means_unlimited(monkeypatch):
     for i in range(50):
         n.hit({"id": str(i)})
     assert len(sent) == 50 and not n.held
+
+
+from datetime import datetime, timedelta  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+NOW = datetime(2026, 11, 18, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+@pytest.mark.parametrize("text,expected_date", [
+    ("刚刚", "2026-11-18"),
+    ("5分钟前", "2026-11-18"),
+    ("3小时前", "2026-11-18"),
+    ("1天前", "2026-11-17"),
+    ("2天前 北京", "2026-11-16"),
+    ("昨天 13:20", "2026-11-17"),
+    ("编辑于 昨天 13:20 广东", "2026-11-17"),
+    ("今天 09:05", "2026-11-18"),
+    ("前天", "2026-11-16"),
+    ("11-15", "2026-11-15"),
+    ("2025-03-02", "2025-03-02"),
+    ("12-30", "2025-12-30"),            # MM-DD in the future means last year
+    ("2 hours ago", "2026-11-18"),
+    ("3 days ago", "2026-11-15"),
+    ("Yesterday 10:00", "2026-11-17"),
+    ("1周前", "2026-11-11"),
+])
+def test_parse_posted_text(text, expected_date):
+    assert rs.parse_posted_text(text, NOW).date().isoformat() == expected_date
+
+
+@pytest.mark.parametrize("text", ["", None, "广东", "99-99", "13-45"])
+def test_unreadable_dates_return_none(text):
+    assert rs.parse_posted_text(text, NOW) is None
+
+
+def test_post_datetime_falls_back_to_note_id_timestamp():
+    ts = int((NOW - timedelta(days=1)).timestamp())
+    note = {"id": f"{ts:08x}" + "0" * 16, "posted": ""}
+    assert rs.post_datetime(note, NOW).date().isoformat() == "2026-11-17"
+    assert rs.post_datetime({"id": "not-an-objectid", "posted": ""}, NOW) is None
+    assert rs.post_datetime({"id": "0" * 24, "posted": ""}, NOW) is None   # timestamp 0: implausible
+
+
+def test_visible_date_beats_note_id():
+    ts = int((NOW - timedelta(days=30)).timestamp())
+    note = {"id": f"{ts:08x}" + "0" * 16, "posted": "3小时前"}
+    assert rs.post_datetime(note, NOW).date().isoformat() == "2026-11-18"
+
+
+def test_too_old():
+    old, yday, today = {"posted": "3天前"}, {"posted": "昨天 12:00"}, {"posted": "2小时前"}
+    assert rs.too_old(old, 1, NOW) and not rs.too_old(yday, 1, NOW) and not rs.too_old(today, 1, NOW)
+    assert rs.too_old(yday, 0, NOW) and not rs.too_old(today, 0, NOW)   # 0 = today only
+    assert not rs.too_old(old, None, NOW)                              # off
+    assert not rs.too_old({"posted": "", "id": "x"}, 1, NOW)           # unknown date: keep
+
+
+def test_max_age_and_timezone_config():
+    assert rs.Config.from_env({}).max_age_days == 1                    # default: today + yesterday
+    assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "0"}).max_age_days == 0
+    assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "off"}).max_age_days is None
+    assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "-1"}).max_age_days is None
+    with pytest.raises(ValueError, match="MAX_POST_AGE_DAYS"):
+        rs.Config.from_env({"MAX_POST_AGE_DAYS": "soon"})
+    assert str(rs.Config.from_env({"TIMEZONE": "Asia/Shanghai"}).tz) == "Asia/Shanghai"
+    with pytest.raises(ValueError, match="TIMEZONE"):
+        rs.Config.from_env({"TIMEZONE": "Mars/Base"})
+
+
+def test_extra_terms_add_a_required_group():
+    c = rs.Config.from_env({"TOPIC_TERMS": "美签", "EVENT_TERMS": "放号", "EXTRA_TERMS": "北京,beijing,\\bBJ\\b"})
+    m = lambda t: rs.is_match(t, c.topic, c.event, c.extra)  # noqa: E731
+    assert m("北京美签放号了")
+    assert m("Beijing 美签 放号")
+    assert not m("上海美签放号了")      # right topic and event, wrong city
+    assert not m("北京天气")            # right city only
+    assert rs.is_match("上海美签放号了", c.topic, c.event)  # extra omitted = unchanged behaviour
