@@ -1,0 +1,5 @@
+node_modules
+auth.json
+seen.json
+hits.jsonl
+.env

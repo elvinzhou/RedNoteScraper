@@ -1,0 +1,12 @@
+[Unit]
+Description=RedNote slot scraper (single run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=@NODE@ scrape.js
+TimeoutStartSec=10min
+Nice=10
