@@ -255,3 +255,72 @@ def test_describe_page_never_leaks_cookie_values():
         def cookies(self): return [{"name": "web_session", "value": "SECRET"}]
     out = rs.describe_page(FakePage(), {"searches": 0, "calls": ["200 /api/x"]}, Ctx())
     assert "has_web_session_cookie=True" in out and "SECRET" not in out
+
+
+class Mouse:
+    def __init__(self, page): self.page = page
+    def wheel(self, dx, dy): self.page.scrolls += 1; self.page.on_scroll(self.page.scrolls)
+
+
+class ScrollPage(FakePage):
+    def __init__(self, on_scroll):
+        super().__init__()
+        self.scrolls, self.on_scroll, self.mouse = 0, on_scroll, Mouse(self)
+
+
+def _note(i): return {"id": f"n{i}", "title": "t", "url": "u"}
+
+
+def test_scroll_skipped_when_newest_results_all_seen(cfg, monkeypatch):
+    monkeypatch.setattr(rs, "pause", lambda page, c: None)
+    page = ScrollPage(lambda n: None)
+    rs.scroll_for_new(page, [_note(1), _note(2)], {"n1", "n2"}, cfg, newest_first=True)
+    assert page.scrolls == 0
+
+
+def test_scroll_stops_once_it_reaches_seen_posts(cfg, monkeypatch):
+    monkeypatch.setattr(rs, "pause", lambda page, c: None)
+    batch = [_note(1)]
+    def more(n):  # pass 1 brings a new post, pass 2 brings only already-seen ones
+        batch.append(_note(10 + n) if n == 1 else _note(2))
+    page = ScrollPage(more)
+    rs.scroll_for_new(page, batch, {"n2"}, cfg, newest_first=True)
+    assert page.scrolls == 2
+
+
+def test_scroll_stops_when_no_more_results_load(cfg, monkeypatch):
+    monkeypatch.setattr(rs, "pause", lambda page, c: None)
+    page = ScrollPage(lambda n: None)
+    rs.scroll_for_new(page, [_note(1)], set(), cfg, newest_first=False)
+    assert page.scrolls == 1
+
+
+def test_scroll_goes_deep_when_sort_failed(cfg, monkeypatch):
+    monkeypatch.setattr(rs, "pause", lambda page, c: None)
+    batch = [_note(0)]
+    page = ScrollPage(lambda n: batch.append(_note(100 + n)))
+    rs.scroll_for_new(page, batch, {"n0"}, cfg, newest_first=False)
+    assert page.scrolls == cfg.max_scrolls
+
+
+def test_notifier_caps_a_flood_into_one_summary(monkeypatch):
+    sent, summaries = [], []
+    monkeypatch.setattr(rs, "notify_hit", lambda h: sent.append(h["id"]))
+    monkeypatch.setattr(rs, "notify_text", lambda subject, text, attachment=None: summaries.append(text))
+    n = rs.Notifier(cap=2)
+    for i in range(5):
+        n.hit({"id": f"n{i}", "title": f"post {i}", "url": f"https://x/{i}"})
+    n.flush()
+    assert sent == ["n0", "n1"]
+    assert len(summaries) == 1 and "3 more" in summaries[0] and "https://x/4" in summaries[0]
+    n.flush()
+    assert len(summaries) == 1  # nothing left to flush
+
+
+def test_notifier_cap_zero_means_unlimited(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rs, "notify_hit", lambda h: sent.append(h))
+    n = rs.Notifier(cap=0)
+    for i in range(50):
+        n.hit({"id": str(i)})
+    assert len(sent) == 50 and not n.held

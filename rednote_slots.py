@@ -18,7 +18,9 @@ Configuration (environment variables or a .env file next to this script):
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
   SMTP_HOST, SMTP_PORT (587), SMTP_USER, SMTP_PASSWORD, MAIL_TO, MAIL_FROM
                    any configured channel receives every hit and every alert
-  MAX_SCROLLS (4)  scroll passes per keyword
+  MAX_SCROLLS (4)  max scroll passes per keyword; scrolling stops early once a pass
+                   brings nothing new, and is skipped if the newest results are all seen
+  MAX_NOTIFY_PER_RUN (10)  hits beyond this arrive as one summary message (0 = no cap)
   DELAY_MIN_MS (2500), DELAY_MAX_MS (5000)  random pause between actions
   RETRIES (3), RETRY_DELAY (30)  page-load errors retry with doubling delay
   ALERT_COOLDOWN_HOURS (24)  min hours between "session expired" alerts
@@ -107,6 +109,7 @@ class Config:
     profile_dir: Path
     browser_path: str | None
     base_url: str | None = None
+    max_notify: int = 10
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
@@ -127,6 +130,7 @@ class Config:
             profile_dir=Path(env.get("REDNOTE_PROFILE_DIR") or HERE / ".browser-profile"),
             browser_path=env.get("REDNOTE_BROWSER_PATH") or None,
             base_url=(env.get("REDNOTE_BASE_URL") or "").rstrip("/") or None,
+            max_notify=int(env.get("MAX_NOTIFY_PER_RUN") or 10),
         )
 
     @property
@@ -404,8 +408,9 @@ def goto_with_retry(page, url: str, cfg: Config) -> None:
             delay *= 2
 
 
-def pause(cfg: Config) -> None:
-    time.sleep(random.uniform(*cfg.delay))
+def pause(page, cfg: Config) -> None:
+    # page.wait_for_timeout (not time.sleep) so response handlers keep running while we wait
+    page.wait_for_timeout(random.uniform(*cfg.delay) * 1000)
 
 
 def load_seen(cfg: Config) -> set[str]:
@@ -513,12 +518,56 @@ def login_flow(cfg: Config) -> int:
             context.close()
 
 
+def scroll_for_new(page, batch: list[dict], seen: set[str], cfg: Config, newest_first: bool) -> None:
+    """Scroll for more results, but only as far as there is something new to find."""
+    def unseen() -> int:
+        return sum(1 for n in batch if n["id"] not in seen)
+
+    if newest_first and not unseen():
+        log("  nothing new in the newest results; not scrolling")
+        return
+    for _ in range(cfg.max_scrolls):
+        total, fresh = len(batch), unseen()
+        page.mouse.wheel(0, 2500)
+        pause(page, cfg)
+        if len(batch) == total:
+            break  # no more results loaded
+        if newest_first and unseen() == fresh:
+            break  # reached posts we've already seen
+
+
+class Notifier:
+    """Sends hits, but caps a single run so a flood becomes one summary message."""
+
+    def __init__(self, cap: int):
+        self.cap, self.sent, self.held = cap, 0, []
+
+    def hit(self, hit: dict) -> None:
+        if self.cap and self.sent >= self.cap:
+            self.held.append(hit)
+            return
+        self.sent += 1
+        notify_hit(hit)
+
+    def flush(self) -> None:
+        if not self.held:
+            return
+        lines = [f"RedNote: {len(self.held)} more matching post(s) (cap {self.cap} per run; "
+                 "all are in hits.jsonl):"]
+        lines += [f"• {h.get('title') or h['id']} {h['url']}" for h in self.held[:10]]
+        if len(self.held) > 10:
+            lines.append(f"…and {len(self.held) - 10} more")
+        notify_text("RedNote: more matches", "\n".join(lines))
+        self.held = []
+
+
 def run(cfg: Config) -> int:
     from playwright.sync_api import sync_playwright  # lazy: tests don't need it
 
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     seen = load_seen(cfg)
     new_hits = failures = 0
+    notifier = Notifier(cfg.max_notify)
 
     with sync_playwright() as p:
         context = open_context(p, cfg)
@@ -556,18 +605,17 @@ def run(cfg: Config) -> int:
                     if problem:
                         log(f"Still failing: {describe_page(page, state, context)}")
                         raise SessionProblem(problem[1], shot(page, "problem"))
-                pause(cfg)
+                pause(page, cfg)
+                newest_first = False
                 for label in ("最新", "Latest"):  # best effort: sort by newest
                     try:
                         page.get_by_text(label, exact=True).first.click(timeout=2000)
+                        newest_first = True
                         break
                     except Exception:  # noqa: BLE001
                         pass
-                pause(cfg)
-
-                for _ in range(cfg.max_scrolls):
-                    page.mouse.wheel(0, 2500)
-                    pause(cfg)
+                pause(page, cfg)
+                scroll_for_new(page, batch, seen, cfg, newest_first)
 
                 for note in list(batch):
                     if note["id"] in seen:
@@ -581,9 +629,10 @@ def run(cfg: Config) -> int:
                         f.write(json.dumps(hit, ensure_ascii=False) + "\n")
                     log(f"HIT: {note['title']}  {note['url']}")
                     new_hits += 1
-                    notify_hit(hit)
+                    notifier.hit(hit)
                 cfg.seen_file.write_text(json.dumps(sorted(seen)))
         finally:
+            notifier.flush()
             context.close()
 
     if failures == len(cfg.keywords):

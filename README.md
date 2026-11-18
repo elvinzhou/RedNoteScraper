@@ -9,7 +9,7 @@ Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com
 1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`--login`); no password is stored.
 2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
 3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex.
-4. New hits are appended to `hits.jsonl`, deduplicated through `seen.json`, and sent with title, link, author, post time, likes and cover image.
+4. Each run only looks at what's new: posts already in `seen.json` are skipped, and scrolling stops as soon as the newest-sorted results reach posts it has seen. New hits are appended to `hits.jsonl` and sent with title, link, author, post time, likes and cover image.
 5. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
 
 It follows the same conventions as [NYTAutoRenew](https://github.com/elvinzhou/NYTAutoRenew): Python + Playwright, system Chromium on the Pi, `.env` config, a systemd user timer, and an auto-update step before each run.
@@ -36,7 +36,12 @@ journalctl --user -u rednote-slots -n 50
 systemctl --user stop rednote-slots.timer       # do this before logging in again (profile lock)
 ```
 
-The timer runs 2 minutes after boot, then every 15 minutes with up to 90 s of random delay. When the alert fires, stop the timer, repeat the manual login step, and start it again.
+The timer runs 2 minutes after boot, then every 15 minutes with up to 90 s of random delay. To change the interval (the override survives auto-updates):
+
+```bash
+systemctl --user edit rednote-slots.timer   # add: [Timer] / OnUnitActiveSec= / OnUnitActiveSec=30min
+```
+ When the alert fires, stop the timer, repeat the manual login step, and start it again.
 
 ## Local development
 
@@ -58,7 +63,8 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook | |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot credentials | |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_TO` | Email | |
-| `MAX_SCROLLS` | Scroll passes per keyword | `4` |
+| `MAX_SCROLLS` | Max scroll passes per keyword (stops early when nothing new) | `4` |
+| `MAX_NOTIFY_PER_RUN` | Hits beyond this become one summary message; `0` = no cap | `10` |
 | `DELAY_MIN_MS`, `DELAY_MAX_MS` | Random pause between actions | `2500`, `5000` |
 | `RETRIES`, `RETRY_DELAY` | Page-load retries, doubling delay (s) | `3`, `30` |
 | `ALERT_COOLDOWN_HOURS` | Min hours between alerts | `24` |
