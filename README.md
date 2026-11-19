@@ -9,7 +9,7 @@ Proof-of-concept watcher for [RedNote (Xiaohongshu)](https://www.xiaohongshu.com
 1. A persistent Chromium profile holds your RedNote login. You log in by hand once (`--login`); no password is stored.
 2. `rednote_slots.py` searches each keyword, scrolls a few times, and reads the search API JSON the page already loads.
 3. A note is a hit if its title matches at least one `TOPIC_TERMS` regex **and** one `EVENT_TERMS` regex (**and** one `EXTRA_TERMS` regex, if you set it).
-4. Only recent posts count: by default today and yesterday (`MAX_POST_AGE_DAYS`). The date comes from the post's visible date ("3小时前", "昨天 13:20", "11-15"), falling back to the creation time embedded in the note id. Posts whose date can't be read are kept.
+4. Only recent posts count: by default the last 4 hours (`MAX_POST_AGE_HOURS`; `MAX_POST_AGE_DAYS` offers a calendar-day window instead). The age comes from the post's visible date ("3小时前", "昨天 13:20", "11-15"), falling back to the creation time embedded in the note id. Posts whose date can't be read are kept.
 5. Each run only looks at what's new: posts already in `seen.json` are skipped, and scrolling stops as soon as the newest-sorted results reach posts it has seen. New hits are appended to `hits.jsonl` and sent with title, link, author, post time, likes and cover image.
 6. If the session expires, a captcha appears, or RedNote blocks the network, you get one alert per `ALERT_COOLDOWN_HOURS` (with a screenshot by email) and the run exits with code 3.
 
@@ -73,8 +73,9 @@ Environment variables, or a `.env` next to the script (real env vars win). See `
 | `TOPIC_TERMS` | Comma-separated regexes; title must match one | none (skip check) |
 | `EVENT_TERMS` | Comma-separated regexes; title must match one | none (skip check) |
 | `EXTRA_TERMS` | Optional third group, e.g. a city; title must match one | none (skip check) |
-| `MAX_POST_AGE_DAYS` | Today plus the previous N days (`0` today only, `off` no limit) | `1` |
-| `TIMEZONE` | IANA zone defining "today", e.g. `Asia/Shanghai` | machine's |
+| `MAX_POST_AGE_HOURS` | Only posts from the last N hours (decimals ok, `off` = no limit); wins over days | `4` |
+| `MAX_POST_AGE_DAYS` | Calendar-day window instead, used only if hours is unset: today plus previous N days | |
+| `TIMEZONE` | IANA zone defining "today" for the days mode, e.g. `Asia/Shanghai` | machine's |
 | `DISCORD_WEBHOOK_URL` | Discord channel webhook | |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram bot credentials | |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_TO` | Email | |
@@ -100,6 +101,7 @@ Exit codes: `0` ok, `1` every search failed (network), `2` bad config, `3` login
 
 - **Regional redirect:** from some locations `www.xiaohongshu.com` redirects to `www.rednote.com`. Logins are per domain, so the scraper follows the redirect and uses that site for both login and searches. Pin one with `REDNOTE_BASE_URL` if needed.
 - **Blocked networks:** RedNote answers some IPs (datacenter, VPN, some clouds) with a "安全限制 / error 300012" page. The scraper detects it and alerts, but a new login won't help; use a home connection (such as the Pi on your LAN).
+- Short windows need a readable post time. RedNote shows "N小时前" for recent posts, which is precise to about the hour, so a 4-hour window can admit a post up to an hour older. A post that only shows a day ("昨天", "2天前") is treated as outside any hours window. Choose a window comfortably larger than the gap between runs.
 - The date filter relies on RedNote's visible date text (several formats are understood) or the note id's embedded creation time, which can precede publishing for posts saved as drafts. Date formats on `rednote.com` are partly guessed.
 - Only note **titles** are matched; the search API doesn't return bodies. Fetching note details would allow body matching.
 - API field names (`note_card.cover`, `corner_tag_info`, ...) are best guesses and the logged-out detection is heuristic. Verify against a real logged-in run and adjust `normalise_note()` / `page_problem()` in `rednote_slots.py`.
