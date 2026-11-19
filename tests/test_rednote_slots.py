@@ -381,16 +381,55 @@ def test_too_old():
     assert not rs.too_old({"posted": "", "id": "x"}, 1, NOW)           # unknown date: keep
 
 
-def test_max_age_and_timezone_config():
-    assert rs.Config.from_env({}).max_age_days == 1                    # default: today + yesterday
-    assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "0"}).max_age_days == 0
+def test_age_window_config_precedence():
+    c = rs.Config.from_env({})
+    assert (c.max_age_hours, c.max_age_days) == (4.0, None)                 # default: last 4 hours
+    c = rs.Config.from_env({"MAX_POST_AGE_HOURS": "2.5"})
+    assert (c.max_age_hours, c.max_age_days) == (2.5, None)
+    c = rs.Config.from_env({"MAX_POST_AGE_DAYS": "1"})
+    assert (c.max_age_hours, c.max_age_days) == (None, 1)                   # days only if hours unset
+    c = rs.Config.from_env({"MAX_POST_AGE_DAYS": "0"})
+    assert (c.max_age_hours, c.max_age_days) == (None, 0)
+    c = rs.Config.from_env({"MAX_POST_AGE_HOURS": "3", "MAX_POST_AGE_DAYS": "7"})
+    assert (c.max_age_hours, c.max_age_days) == (3.0, None)                 # hours win
+    for off in ("off", "none", "-1"):
+        c = rs.Config.from_env({"MAX_POST_AGE_HOURS": off, "MAX_POST_AGE_DAYS": "1"})
+        assert (c.max_age_hours, c.max_age_days) == (None, None)            # explicit: no limit at all
     assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "off"}).max_age_days is None
-    assert rs.Config.from_env({"MAX_POST_AGE_DAYS": "-1"}).max_age_days is None
+    for bad in ({"MAX_POST_AGE_HOURS": "soon"}, {"MAX_POST_AGE_HOURS": "0"}, {"MAX_POST_AGE_HOURS": "-2"}):
+        with pytest.raises(ValueError, match="MAX_POST_AGE_HOURS"):
+            rs.Config.from_env(bad)
     with pytest.raises(ValueError, match="MAX_POST_AGE_DAYS"):
         rs.Config.from_env({"MAX_POST_AGE_DAYS": "soon"})
+
+
+def test_timezone_config():
     assert str(rs.Config.from_env({"TIMEZONE": "Asia/Shanghai"}).tz) == "Asia/Shanghai"
     with pytest.raises(ValueError, match="TIMEZONE"):
         rs.Config.from_env({"TIMEZONE": "Mars/Base"})
+
+
+def test_too_old_in_hours():
+    h = lambda text, hours: rs.too_old({"posted": text}, None, NOW, hours)  # noqa: E731
+    assert not h("刚刚", 2) and not h("30分钟前", 2) and not h("2小时前", 2)
+    assert h("3小时前", 2) and not h("3小时前", 4) and not h("4小时前", 4) and h("5小时前", 4)
+    assert h("昨天 13:20", 4)                       # ~26h ago
+    assert not h("昨天 13:20", 30)                   # still inside a 30h window
+    assert h("2天前", 24) and h("11-15", 24)         # day-level dates can't be inside a short window
+    assert not rs.too_old({"posted": "9小时前"}, None, NOW, None)   # no limits at all
+    assert not rs.too_old({"posted": "", "id": "x"}, None, NOW, 2)   # unknown date: keep
+
+
+def test_hours_window_uses_note_id_when_no_visible_date():
+    recent = {"id": f"{int((NOW - timedelta(hours=3)).timestamp()):08x}" + "0" * 16, "posted": ""}
+    stale = {"id": f"{int((NOW - timedelta(hours=6)).timestamp()):08x}" + "0" * 16, "posted": ""}
+    assert not rs.too_old(recent, None, NOW, 4) and rs.too_old(stale, None, NOW, 4)
+
+
+def test_hours_take_precedence_over_days_in_too_old():
+    note = {"posted": "昨天 13:20"}   # yesterday: inside a 1-day window, outside 4 hours
+    assert not rs.too_old(note, 1, NOW)
+    assert rs.too_old(note, 1, NOW, 4)
 
 
 def test_extra_terms_add_a_required_group():

@@ -15,9 +15,11 @@ Configuration (environment variables or a .env file next to this script):
                    Empty = skip this check.
   EVENT_TERMS      same; title must also match one of these. Empty = skip.
   EXTRA_TERMS      optional third group, e.g. a city: title must match one of these too.
-  MAX_POST_AGE_DAYS (1)  only posts from today and the previous N days: 0 = today only,
-                   1 = today + yesterday, "off" = no limit. Posts with an unreadable
-                   date are kept.
+  MAX_POST_AGE_HOURS (4)  only posts from the last N hours (decimals ok, e.g. 2.5);
+                   "off" = no age limit. Overrides MAX_POST_AGE_DAYS.
+  MAX_POST_AGE_DAYS  alternative calendar-day window, used only if HOURS is unset:
+                   today and the previous N days (0 = today only, 1 = today + yesterday).
+                   Posts with an unreadable date are kept in either mode.
   TIMEZONE         IANA zone that defines "today" (default: this machine's, e.g. Asia/Shanghai)
   DISCORD_WEBHOOK_URL
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
@@ -112,6 +114,24 @@ def parse_max_age(value: str | None) -> int | None:
         raise ValueError(f"MAX_POST_AGE_DAYS: expected a number or 'off', got {value!r}") from e
 
 
+def parse_max_age_hours(hours: str | None, days: str | None) -> tuple[float | None, int | None]:
+    """Resolve the age window -> (hours, days). Hours win; nothing set means 4 hours."""
+    h = (hours or "").strip().lower()
+    if h in ("off", "none", "no", "-1"):
+        return None, None  # explicitly no age limit at all
+    if h:
+        try:
+            value = float(h)
+        except ValueError as e:
+            raise ValueError(f"MAX_POST_AGE_HOURS: expected a number or 'off', got {hours!r}") from e
+        if value <= 0:
+            raise ValueError("MAX_POST_AGE_HOURS must be greater than 0")
+        return value, None
+    if (days or "").strip():
+        return None, parse_max_age(days)
+    return 4.0, None
+
+
 def parse_tz(value: str | None):
     if not (value or "").strip():
         return datetime.now().astimezone().tzinfo
@@ -138,13 +158,15 @@ class Config:
     base_url: str | None = None
     max_notify: int = 10
     extra: list[re.Pattern] = field(default_factory=list)
-    max_age_days: int | None = 1
+    max_age_days: int | None = None   # calendar-day window; only used when hours is None
+    max_age_hours: float | None = 4.0  # rolling window in hours (takes precedence)
     tz: object = None  # tzinfo
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
         env = os.environ if env is None else env
         data_dir = Path(env.get("DATA_DIR") or HERE)
+        age_hours, age_days = parse_max_age_hours(env.get("MAX_POST_AGE_HOURS"), env.get("MAX_POST_AGE_DAYS"))
         return cls(
             keywords=split_list(env.get("KEYWORDS")),
             topic=compile_terms("TOPIC_TERMS", env.get("TOPIC_TERMS")),
@@ -162,7 +184,8 @@ class Config:
             base_url=(env.get("REDNOTE_BASE_URL") or "").rstrip("/") or None,
             max_notify=int(env.get("MAX_NOTIFY_PER_RUN") or 10),
             extra=compile_terms("EXTRA_TERMS", env.get("EXTRA_TERMS")),
-            max_age_days=parse_max_age(env.get("MAX_POST_AGE_DAYS")),
+            max_age_hours=age_hours,
+            max_age_days=age_days,
             tz=parse_tz(env.get("TIMEZONE")),
         )
 
@@ -245,12 +268,16 @@ def post_datetime(note: dict, now: datetime) -> datetime | None:
     return None
 
 
-def too_old(note: dict, max_age_days: int | None, now: datetime) -> bool:
-    if max_age_days is None:
+def too_old(note: dict, max_age_days: int | None, now: datetime,
+             max_age_hours: float | None = None) -> bool:
+    """Hours (a rolling window) take precedence over days (calendar days)."""
+    if max_age_hours is None and max_age_days is None:
         return False
     dt = post_datetime(note, now)
     if dt is None:
         return False  # unknown date: keep it rather than miss a post
+    if max_age_hours is not None:
+        return dt < now - timedelta(hours=max_age_hours)
     return dt.date() < now.date() - timedelta(days=max_age_days)
 
 
@@ -671,7 +698,7 @@ def run(cfg: Config) -> int:
     new_hits = failures = 0
     notifier = Notifier(cfg.max_notify)
     now = cfg.now()
-    is_new = lambda n: n["id"] not in seen and not too_old(n, cfg.max_age_days, now)  # noqa: E731
+    is_new = lambda n: n["id"] not in seen and not too_old(n, cfg.max_age_days, now, cfg.max_age_hours)  # noqa: E731
 
     with sync_playwright() as p:
         context = open_context(p, cfg)
@@ -725,7 +752,7 @@ def run(cfg: Config) -> int:
                     if note["id"] in seen:
                         continue
                     seen.add(note["id"])
-                    if too_old(note, cfg.max_age_days, now):
+                    if too_old(note, cfg.max_age_days, now, cfg.max_age_hours):
                         continue
                     if not is_match(note["title"], cfg.topic, cfg.event, cfg.extra):
                         continue
